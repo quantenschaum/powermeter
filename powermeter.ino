@@ -2,24 +2,27 @@
 #include <SPI.h>
 #include <Ethernet.h>
 #include <Streaming.h>
+#include <Time.h>
 
 #define WPPPS 1.25*3600 // watts per pules per seconds
+#define MIN_TIME 1436012692 // minimum valid time (UTC, secs sincs epoch) 
+#define TIMEZONE 0 // offset in hours
+#define TIME_RESYNC 3600ul // timeout in s after which the time is pulled from the net
 #define MIN_DT 50
 #define SECS 5
 #define SERVER "nas"
 #define PORT 80
-#define PATH F("/strom/log.py?t=")<<unixTime(t)<<F("&pulses=")<<pulses<<F("&pps=")<<pps<<F("&watts=")<<watts
-#define RESET 9
+#define PATH F("/strom/log.py?t=")<<t<<F("&pulses=")<<pulses<<F("&pps=")<<pps<<F("&watts=")<<watts
 #define MAX_ERROR_COUNT 3
 #define WEB_SERVER_BUFFER_SIZE 16
 #define ETH_CS 10
 #define SD_CS 4
 
 #define LOCAL_CLIENT // use local ethernet clients instead of a single global on
-#define PUSH_DATA
-//#define WEB_SERVER
-#define SD_LOGGER
-//#define SERIAL_OUTPUT
+//#define PUSH_DATA
+#define WEB_SERVER
+//#define SD_LOGGER
+#define SERIAL_OUTPUT 115200
 #define LOGGING
 
 #if defined(SD_LOGGER)
@@ -30,8 +33,8 @@
 
 #if defined(LOGGING)
 #define LOG(msg) {Serial << msg << endl; LOGSD(msg)}
-#define LOG_INFO(s)  {unsigned long t=millis(); LOG(F("INFO(")  << unixTime(t) << F("):") << F(s))}
-#define LOG_ERROR(s) {unsigned long t=millis(); LOG(F("ERROR(") << unixTime(t) << F("):") << F(s))}
+#define LOG_INFO(s)  {LOG(F("INFO(")  << now() << F("):") << F(s))}
+#define LOG_ERROR(s) {LOG(F("ERROR(") << now() << F("):") << F(s))}
 #else
 #define LOG_INFO(s)
 #define LOG_ERROR(s)
@@ -56,23 +59,71 @@ EthernetClient client;
 
 
 volatile unsigned long pulses = 0, pulse_time = 0;
-unsigned long t0 = 0, p0 = 0, toffset = 0, tset = 0;
+unsigned long t0 = 0, p0 = 0;
 float pps = 0, watts = 0;
 byte error_count = 0;
 char nl[] = "\n";
 
 void (*soft_reset)() = 0;
 
-void hard_reset() {
-  LOG_ERROR("reset");
-  delay(2000);
-  pinMode(RESET, OUTPUT);
-  digitalWrite(RESET, LOW);
+#define NTP_PACKET_SIZE 48 // NTP time is in the first 48 bytes of message
+
+time_t getNtpTime() {
+  EthernetUDP Udp;
+  Udp.begin(8888);
+  while (Udp.parsePacket() > 0) ; // discard any previously received packets
+  byte packetBuffer[NTP_PACKET_SIZE]; //buffer to hold incoming & outgoing packets
+#if defined(NTP_SERVER)
+  IPAddress NTP_SERVER;
+#else
+  IPAddress ntpIp = Ethernet.gatewayIP();
+#endif
+  sendNTPpacket(Udp, packetBuffer, ntpIp);
+  uint32_t beginWait = millis();
+  while (millis() - beginWait < 1500) {
+    int size = Udp.parsePacket();
+    if (size >= NTP_PACKET_SIZE) {
+      Udp.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
+      unsigned long secsSince1900;
+      // convert four bytes starting at location 40 to a long integer
+      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
+      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
+      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
+      secsSince1900 |= (unsigned long)packetBuffer[43];
+      time_t t = secsSince1900 - 2208988800UL;
+      return t > MIN_TIME ? t + TIMEZONE * SECS_PER_HOUR : 0;
+    }
+  }
+  return 0; // return 0 if unable to get the time
 }
 
+// send an NTP request to the time server at the given address
+void sendNTPpacket(EthernetUDP &Udp, byte packetBuffer[], IPAddress &address) {
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12]  = 49;
+  packetBuffer[13]  = 0x4E;
+  packetBuffer[14]  = 49;
+  packetBuffer[15]  = 52;
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
+}
+
+
+
 void error() {
+  LOG_ERROR("new error");
   if (error_count++ > MAX_ERROR_COUNT) {
-    hard_reset();
     delay(2000);
     soft_reset();
   }
@@ -91,100 +142,8 @@ void count() {
 }
 
 
-unsigned long webUnixTime(Client &client) {
-  unsigned long time = 0;
-
-  // Just choose any reasonably busy web server, the load is really low
-  if (client.connect(SERVER, PORT))  {
-    // Make an HTTP 1.1 request which is missing a Host: header
-    // compliant servers are required to answer with an error that includes
-    // a Date: header.
-    client.print(F("GET / HTTP/1.1 \r\n\r\n"));
-
-    char buf[5];			// temporary buffer for characters
-    client.setTimeout(5000);
-    if (client.find("\r\nDate: ") // look for Date: header
-        && client.readBytes(buf, 5) == 5) // discard
-    {
-      unsigned day = client.parseInt();	   // day
-      client.readBytes(buf, 1);	   // discard
-      client.readBytes(buf, 3);	   // month
-      int year = client.parseInt();	   // year
-      byte hour = client.parseInt();   // hour
-      byte minute = client.parseInt(); // minute
-      byte second = client.parseInt(); // second
-
-      int daysInPrevMonths;
-      switch (buf[0])
-      {
-        case 'F': daysInPrevMonths =  31; break; // Feb
-        case 'S': daysInPrevMonths = 243; break; // Sep
-        case 'O': daysInPrevMonths = 273; break; // Oct
-        case 'N': daysInPrevMonths = 304; break; // Nov
-        case 'D': daysInPrevMonths = 334; break; // Dec
-        default:
-          if (buf[0] == 'J' && buf[1] == 'a')
-            daysInPrevMonths = 0;		// Jan
-          else if (buf[0] == 'A' && buf[1] == 'p')
-            daysInPrevMonths = 90;		// Apr
-          else switch (buf[2])
-            {
-              case 'r': daysInPrevMonths =  59; break; // Mar
-              case 'y': daysInPrevMonths = 120; break; // May
-              case 'n': daysInPrevMonths = 151; break; // Jun
-              case 'l': daysInPrevMonths = 181; break; // Jul
-              default: // add a default label here to avoid compiler warning
-              case 'g': daysInPrevMonths = 212; break; // Aug
-            }
-      }
-
-      // This code will not work after February 2100
-      // because it does not account for 2100 not being a leap year and because
-      // we use the day variable as accumulator, which would overflow in 2149
-      day += (year - 1970) * 365;	// days from 1970 to the whole past year
-      day += (year - 1969) >> 2;	// plus one day per leap year
-      day += daysInPrevMonths;	// plus days for previous months this year
-      if (daysInPrevMonths >= 59	// if we are past February
-          && ((year & 3) == 0))	// and this is a leap year
-        day += 1;			// add one day
-      // Remove today, add hours, minutes and seconds this month
-      time = (((day - 1ul) * 24 + hour) * 60 + minute) * 60 + second;
-    }
-  }
-  delay(100);
-  client.flush();
-  client.stop();
-
-  return time;
-}
-
-
-
-void adjustTime() {
-#if defined(LOCAL_CLIENT)
-  EthernetClient client;
-#endif
-  unsigned long tunix = 0;
-  while (tunix == 0) {
-    tunix = webUnixTime(client);
-    if (!tunix) {
-      LOG_ERROR("adjust time failed");
-      error();
-      delay(3000);
-    } else {
-      toffset = tunix - (tset = millis()) / 1000;
-      success();
-      LOG_INFO("time adjusted");
-    }
-  }
-}
-
-unsigned long unixTime(unsigned long &tms) {
-  return tms / 1000 + toffset;
-}
-
 void printData(Print &s, unsigned long &t, unsigned long &pulses, float &pps, float &watts, char sep[]) {
-  s << F("t=") << unixTime(t) << sep;
+  s << F("t=") << t << sep;
   s << F("pulses=") << pulses << sep;
   s << F("pps=") << pps << sep;
   s << F("watts=") << watts << nl;
@@ -199,20 +158,18 @@ void web(WebServer &server, WebServer::ConnectionType type, char* query, bool co
     if (type == WebServer::HEAD)
       return;
     server.httpSuccess("text/plain", "Cache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n");
-    printData(server, t0, p0, pps, watts, nl);
+    unsigned long t1 = pulse_time, p1 = pulses;
+    time_t ts = msToTime(t1);
+    printData(server, ts, p1, pps, watts, nl);
   }
 }
 #endif
 
 #if defined(PUSH_DATA)
-void pushdata(unsigned long &t, unsigned long &pulses, float &pps, float &watts) {
+void pushdata(time_t &t, unsigned long &pulses, float &pps, float &watts) {
 #if defined(LOCAL_CLIENT)
   EthernetClient client;
 #endif
-  if (toffset == 0) {
-    LOG_ERROR("clock not set");
-    error();
-  }
   if (client.connect(SERVER, PORT) == 1) {
     client << F("GET ") << PATH << F(" HTTP/1.1") << endl ;
     client << F("Host: ") << SERVER << endl;
@@ -244,7 +201,7 @@ void initSD() {
   }
 }
 
-void logToSD(unsigned long &t, unsigned long &p, float &pps, float &watts) {
+void logToSD(time_t &t, unsigned long &p, float &pps, float &watts) {
   File f = SD.open("data.log", FILE_WRITE);
   if (f) {
     printData(f, t, p, pps, watts, ", ");
@@ -257,28 +214,39 @@ void logToSD(unsigned long &t, unsigned long &p, float &pps, float &watts) {
 }
 #endif
 
+time_t msToTime(unsigned long &ms) {
+  return now() - (millis() - ms) / 1000ul;
+}
+
 void logData(unsigned long &t, unsigned long &p, float &pps, float &watts) {
+  if (timeStatus() == timeNotSet) {
+    LOG_ERROR("clock not set");
+    error();
+  }
+
+  time_t ts = msToTime(t);
 #if defined(SERIAL_OUTPUT)
-  printData(Serial, t, p, pps, watts, nl);
+  printData(Serial, ts, p, pps, watts, nl);
 #endif
 #if defined(PUSH_DATA)
-  pushdata(t, p, pps, watts);
+  pushdata(ts, p, pps, watts);
 #endif
 #if defined(SD_LOGGER)
-  logToSD(t, p, pps, watts);
+  logToSD(ts, p, pps, watts);
 #endif
 }
 
 void setup() {
-  pinMode(RESET, INPUT_PULLUP);
   wdt_enable(WDTO_8S);
 #if defined(SERIAL_OUTPUT) || defined(LOGGING)
-  Serial.begin(115200);
+  Serial.begin(SERIAL_OUTPUT);
 #endif
   LOG_INFO("starting");
   pinMode(2, INPUT_PULLUP);
   delay(1000);
   Ethernet.begin(mac, ip);
+  setSyncProvider(getNtpTime);
+  setSyncInterval(TIME_RESYNC);
 #if defined(WEB_SERVER)
   webserver.setDefaultCommand(&web);
   webserver.begin();
@@ -286,7 +254,6 @@ void setup() {
 #if defined(SD_LOGGER)
   initSD();
 #endif
-  adjustTime();
   attachInterrupt(0, count, FALLING);
   sei();
   LOG_INFO("up");
@@ -294,11 +261,8 @@ void setup() {
 
 void loop() {
   unsigned long t = millis();
-  if (t - tset > 3600000) {
-    adjustTime();
-  }
   unsigned long t1 = pulse_time, p1 = pulses;
-  float dt = (t1 - t0) / 1000.0;
+  float dt = (t1 - t0) / 1000.;
   if (dt > SECS) {
     pps = (p1 - p0) / dt;
     watts = WPPPS * pps;
@@ -309,10 +273,12 @@ void loop() {
   } else if (t - t0 > 60000) {
     watts = pps = 0;
   }
+
 #if defined(WEB_SERVER)
   char buff[WEB_SERVER_BUFFER_SIZE];
   int len = WEB_SERVER_BUFFER_SIZE;
-  webserver.processConnection(buff, len);
+  webserver.processConnection(buff, &len);
 #endif
+
   wdt_reset();
 }
