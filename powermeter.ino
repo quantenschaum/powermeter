@@ -5,9 +5,9 @@
 #include <Time.h>
 
 #define WPPPS 1.25*3600 // watts per pules per seconds
-#define MIN_TIME 1436012692 // minimum valid time (UTC, secs sincs epoch) 
+#define MIN_TIME 1446841865 // minimum valid time (UTC, secs sincs epoch) 
 #define TIMEZONE 0 // offset in hours
-#define TIME_RESYNC 3600ul // timeout in s after which the time is pulled from the net
+#define TIME_RESYNC 600 // timeout in s after which the time is pulled from the net
 #define MIN_DT 50
 #define SECS 5
 #define SERVER "nas"
@@ -22,8 +22,8 @@
 //#define PUSH_DATA
 #define WEB_SERVER
 //#define SD_LOGGER
-#define SERIAL_OUTPUT 115200
-#define LOGGING
+//#define SERIAL_OUTPUT 115200
+//#define LOGGING
 
 #if defined(SD_LOGGER)
 #define LOGSD(msg) {File f = SD.open("data.log", FILE_WRITE); if(f){f << msg << endl; f.close();}}
@@ -157,7 +157,7 @@ void web(WebServer &server, WebServer::ConnectionType type, char* query, bool co
   } else {
     if (type == WebServer::HEAD)
       return;
-    server.httpSuccess("text/plain", "Cache-Control: no-cache, no-store, must-revalidate\r\nPragma: no-cache\r\nExpires: 0\r\n");
+    server.httpSuccess("text/plain", "Cache-Control: no-cache\r\n");
     unsigned long t1 = pulse_time, p1 = pulses;
     time_t ts = msToTime(t1);
     printData(server, ts, p1, pps, watts, nl);
@@ -219,12 +219,13 @@ time_t msToTime(unsigned long &ms) {
 }
 
 void logData(unsigned long &t, unsigned long &p, float &pps, float &watts) {
+  time_t ts = msToTime(t);
+
   if (timeStatus() == timeNotSet) {
     LOG_ERROR("clock not set");
     error();
   }
 
-  time_t ts = msToTime(t);
 #if defined(SERIAL_OUTPUT)
   printData(Serial, ts, p, pps, watts, nl);
 #endif
@@ -243,7 +244,6 @@ void setup() {
 #endif
   LOG_INFO("starting");
   pinMode(2, INPUT_PULLUP);
-  delay(1000);
   Ethernet.begin(mac, ip);
   setSyncProvider(getNtpTime);
   setSyncInterval(TIME_RESYNC);
